@@ -106,7 +106,7 @@ This repo is built **commit-by-commit** to mirror a live one-hour hackathon:
 | 4 | Done | Dashboard shell (nav, hearts, theme) |
 | 5 | Done | Profile (username, stats, refill caption) |
 | 6 | Done | Play (guessing game MVP) |
-| 7 | — | Explore |
+| 7 | Done | Explore |
 | 8 | — | Collection |
 | 9–13 | — | Hearts economy APIs, Stripe, rooms, atlas, polish |
 
