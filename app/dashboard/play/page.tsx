@@ -1,10 +1,10 @@
-import { Stack, Text, Title } from "@mantine/core";
+import { Suspense } from "react";
+import PlaySection from "@/components/sections/play";
 
-export default function PlayPage() {
+export default function DashboardPlayPage() {
   return (
-    <Stack gap="sm">
-      <Title order={2}>Play</Title>
-      <Text c="dimmed">Artifact guessing game — coming in Step 6.</Text>
-    </Stack>
+    <Suspense fallback={null}>
+      <PlaySection />
+    </Suspense>
   );
 }

@@ -1,9 +1,72 @@
-import { createSlice } from "@reduxjs/toolkit";
+import { createAsyncThunk, createSlice } from "@reduxjs/toolkit";
 import type { CollectionArtifact } from "@/lib/types/collection";
+import { supabase } from "@/lib/supabase/client";
+
+const USER_COLLECTIONS_USER_COLUMN = "user_id" as const;
+
+type ArtifactRow = Record<string, unknown>;
+
+function pickStr(row: ArtifactRow, keys: string[], fallback = ""): string {
+  for (const k of keys) {
+    const v = row[k];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return fallback;
+}
+
+function pickYear(row: ArtifactRow, keys: string[]): string | undefined {
+  for (const k of keys) {
+    const v = row[k];
+    if (typeof v === "number" && Number.isFinite(v)) return String(v);
+    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
+
+export function mapArtifactRow(row: ArtifactRow): CollectionArtifact | null {
+  const id = row.id;
+  if (typeof id !== "string" && typeof id !== "number") return null;
+
+  const countryCodeRaw = pickStr(row, ["country_code", "countryCode", "origin_country_code", "iso2"], "").trim();
+  const countryCode = countryCodeRaw ? countryCodeRaw.toUpperCase() : undefined;
+
+  return {
+    id: String(id),
+    title: pickStr(row, ["title", "name", "label"], "Artifact"),
+    pixelImageUrl: pickStr(row, [
+      "art_image_url",
+      "pixel_image_url",
+      "pixel_art_url",
+      "image_8bit",
+      "thumbnail_pixel_url",
+      "image_pixel",
+      "real_image_url",
+      "real_photo_url",
+      "full_image_url",
+      "image_url",
+      "photo_url",
+    ]),
+    realImageUrl: pickStr(row, [
+      "real_image_url",
+      "real_photo_url",
+      "full_image_url",
+      "image_url",
+      "photo_url",
+    ]),
+    facts: pickStr(row, ["facts", "fun_fact", "description", "story", "caption"]),
+    year: pickYear(row, ["year", "artifact_year", "era", "date", "origin_year"]),
+    countryCode,
+    countryName: pickStr(row, ["country_name", "country", "origin_country", "origin"], "") || undefined,
+    museumName:
+      pickStr(row, ["museum_name", "museumName", "home_museum", "venue_name", "institution"], "") || undefined,
+    mapUrl: pickStr(row, ["map_url", "mapUrl"], "") || undefined,
+  };
+}
 
 type CollectionState = {
   items: CollectionArtifact[];
   unlockedIds: string[];
+  totalCatalogCount: number;
   status: "idle" | "loading" | "succeeded" | "failed";
   error: string | null;
 };
@@ -11,9 +74,50 @@ type CollectionState = {
 const initialState: CollectionState = {
   items: [],
   unlockedIds: [],
+  totalCatalogCount: 0,
   status: "idle",
   error: null,
 };
+
+export const fetchUserCollection = createAsyncThunk(
+  "collection/fetchUserCollection",
+  async (userId: string, { rejectWithValue }) => {
+    if (!supabase) {
+      return rejectWithValue("Supabase client is not configured.");
+    }
+
+    const [{ data: artifactRows, error: artError }, ucResult] = await Promise.all([
+      supabase.from("artifacts").select("*"),
+      supabase.from("user_collections").select("artifact_id").eq(USER_COLLECTIONS_USER_COLUMN, userId),
+    ]);
+
+    if (artError) {
+      return rejectWithValue(artError.message);
+    }
+
+    if (ucResult.error) {
+      return rejectWithValue(ucResult.error.message);
+    }
+
+    const artifactIds = (ucResult.data ?? [])
+      .map((r) => r.artifact_id as string | undefined)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+
+    const byId = new Map<string, CollectionArtifact>();
+    for (const raw of artifactRows ?? []) {
+      const mapped = mapArtifactRow(raw as ArtifactRow);
+      if (mapped) byId.set(mapped.id, mapped);
+    }
+
+    const items = Array.from(byId.values());
+
+    return {
+      items,
+      unlockedIds: artifactIds,
+      totalCatalogCount: items.length,
+    };
+  },
+);
 
 const collectionSlice = createSlice({
   name: "collection",
@@ -22,11 +126,34 @@ const collectionSlice = createSlice({
     clearCollection: (state) => {
       state.items = [];
       state.unlockedIds = [];
+      state.totalCatalogCount = 0;
       state.status = "idle";
       state.error = null;
     },
+    unlockArtifact: (state, action: { payload: string }) => {
+      if (!state.unlockedIds.includes(action.payload)) {
+        state.unlockedIds.push(action.payload);
+      }
+    },
+  },
+  extraReducers: (builder) => {
+    builder
+      .addCase(fetchUserCollection.pending, (state) => {
+        state.status = "loading";
+        state.error = null;
+      })
+      .addCase(fetchUserCollection.fulfilled, (state, action) => {
+        state.status = "succeeded";
+        state.items = action.payload.items;
+        state.unlockedIds = action.payload.unlockedIds;
+        state.totalCatalogCount = action.payload.totalCatalogCount;
+      })
+      .addCase(fetchUserCollection.rejected, (state, action) => {
+        state.status = "failed";
+        state.error = (action.payload as string) ?? "Failed to load collection.";
+      });
   },
 });
 
-export const { clearCollection } = collectionSlice.actions;
+export const { clearCollection, unlockArtifact } = collectionSlice.actions;
 export const collectionReducer = collectionSlice.reducer;
