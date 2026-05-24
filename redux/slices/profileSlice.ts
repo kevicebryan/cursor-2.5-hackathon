@@ -1,5 +1,6 @@
-import { createAsyncThunk, createSlice } from "@reduxjs/toolkit";
+import { createAsyncThunk, createSlice, type PayloadAction } from "@reduxjs/toolkit";
 import { supabase } from "@/lib/supabase/client";
+import { HEART_REFILL_INTERVAL_MS, MAX_HEARTS } from "@/util/constant";
 
 type ProfileRecord = {
   id: string;
@@ -13,15 +14,77 @@ type ProfileRecord = {
 
 type ProfileState = {
   profile: ProfileRecord | null;
+  collectedArtifactCount: number;
+  unlockedCountryCodes: string[];
+  availableCountryCodes: string[];
+  artifactsByCountryCode: Record<string, string[]>;
+  mapUrlByCountryCode: Record<string, string>;
+  unlockedRegions: string[];
+  availableRegions: string[];
   status: "idle" | "loading" | "succeeded" | "failed";
   error: string | null;
 };
 
 const initialState: ProfileState = {
   profile: null,
+  collectedArtifactCount: 0,
+  unlockedCountryCodes: [],
+  availableCountryCodes: [],
+  artifactsByCountryCode: {},
+  mapUrlByCountryCode: {},
+  unlockedRegions: [],
+  availableRegions: [],
   status: "idle",
   error: null,
 };
+
+type ArtifactGeoRow = {
+  country_code: string | null;
+  region: string | null;
+  map_url?: string | null;
+} & Record<string, unknown>;
+
+type UserCollectionArtifactRow = {
+  artifacts: ArtifactGeoRow | ArtifactGeoRow[] | null;
+};
+
+type ProfileFetchResult = {
+  profile: ProfileRecord | null;
+  collectedArtifactCount: number;
+  unlockedCountryCodes: string[];
+  availableCountryCodes: string[];
+  artifactsByCountryCode: Record<string, string[]>;
+  mapUrlByCountryCode: Record<string, string>;
+  unlockedRegions: string[];
+  availableRegions: string[];
+};
+
+function normalizeCode(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const normalized = value.trim().toUpperCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function normalizeRegion(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function asSortedStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string").sort();
+}
+
+function pickArtifactName(row: Record<string, unknown>): string | null {
+  for (const key of ["title", "name", "label"]) {
+    const value = row[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return null;
+}
 
 export const fetchProfileByUserId = createAsyncThunk(
   "profile/fetchByUserId",
@@ -30,19 +93,122 @@ export const fetchProfileByUserId = createAsyncThunk(
       return rejectWithValue("Supabase client is not configured.");
     }
 
-    const { data, error } = await supabase
-      .from("profiles")
-      .select(
-        "id, username, hearts, last_heart_reset, total_items_restored, updated_at, room_bg",
-      )
-      .eq("id", userId)
-      .maybeSingle();
+    const [profileResult, availableGeoResult, collectionGeoResult] =
+      await Promise.all([
+        supabase
+          .from("profiles")
+          .select(
+            "id, username, hearts, last_heart_reset, total_items_restored, updated_at, room_bg",
+          )
+          .eq("id", userId)
+          .maybeSingle(),
+        supabase.from("artifacts").select("*"),
+        supabase
+          .from("user_collections")
+          .select(
+            "artifacts:artifacts!user_collections_artifact_id_fkey(country_code, region)",
+          )
+          .eq("user_id", userId),
+      ]);
 
-    if (error) {
-      return rejectWithValue(error.message);
+    if (profileResult.error) {
+      return rejectWithValue(profileResult.error.message);
+    }
+    if (availableGeoResult.error) {
+      return rejectWithValue(availableGeoResult.error.message);
+    }
+    if (collectionGeoResult.error) {
+      return rejectWithValue(collectionGeoResult.error.message);
     }
 
-    return { profile: (data as ProfileRecord | null) ?? null };
+    const availableCountries = new Set<string>();
+    const availableRegions = new Set<string>();
+    const artifactsByCountryCode = new Map<string, Set<string>>();
+    const mapUrlByCountryCode = new Map<string, string>();
+    const unlockedCountries = new Set<string>();
+    const unlockedRegions = new Set<string>();
+
+    const collectionRows = (collectionGeoResult.data ??
+      []) as UserCollectionArtifactRow[];
+
+    for (const artifact of (availableGeoResult.data ?? []) as ArtifactGeoRow[]) {
+      const countryCode = normalizeCode(artifact.country_code);
+      const region = normalizeRegion(artifact.region);
+      if (countryCode) availableCountries.add(countryCode);
+      if (region) availableRegions.add(region);
+      if (countryCode) {
+        if (!mapUrlByCountryCode.has(countryCode)) {
+          const rawUrl = artifact.map_url;
+          if (typeof rawUrl === "string" && rawUrl.trim().length > 0) {
+            mapUrlByCountryCode.set(countryCode, rawUrl.trim());
+          }
+        }
+        const artifactName = pickArtifactName(artifact);
+        if (artifactName) {
+          if (!artifactsByCountryCode.has(countryCode)) {
+            artifactsByCountryCode.set(countryCode, new Set<string>());
+          }
+          artifactsByCountryCode.get(countryCode)?.add(artifactName);
+        }
+      }
+    }
+
+    for (const collection of collectionRows) {
+      const artifact = Array.isArray(collection.artifacts)
+        ? (collection.artifacts[0] ?? null)
+        : collection.artifacts;
+      const countryCode = normalizeCode(artifact?.country_code);
+      const region = normalizeRegion(artifact?.region);
+      if (countryCode) unlockedCountries.add(countryCode);
+      if (region) unlockedRegions.add(region);
+    }
+
+    let profile = profileResult.data as ProfileRecord | null;
+
+    if (profile && profile.hearts < MAX_HEARTS && profile.last_heart_reset) {
+      const lastMs = new Date(profile.last_heart_reset).getTime();
+      if (Number.isFinite(lastMs)) {
+        const dueMs = lastMs + HEART_REFILL_INTERVAL_MS;
+        if (Date.now() >= dueMs) {
+          const nowIso = new Date().toISOString();
+          const refillResult = await supabase
+            .from("profiles")
+            .update({ hearts: MAX_HEARTS, last_heart_reset: nowIso })
+            .eq("id", userId)
+            .select(
+              "id, username, hearts, last_heart_reset, total_items_restored, updated_at, room_bg",
+            )
+            .maybeSingle();
+
+          if (refillResult.error) {
+            return rejectWithValue(refillResult.error.message);
+          }
+          profile = (refillResult.data as ProfileRecord | null) ?? profile;
+        }
+      }
+    }
+
+    const result: ProfileFetchResult = {
+      profile,
+      collectedArtifactCount: collectionRows.length,
+      unlockedCountryCodes: Array.from(unlockedCountries).sort(),
+      availableCountryCodes: Array.from(availableCountries).sort(),
+      artifactsByCountryCode: Object.fromEntries(
+        Array.from(artifactsByCountryCode.entries()).map(([countryCode, names]) => [
+          countryCode,
+          Array.from(names).sort(),
+        ]),
+      ),
+      mapUrlByCountryCode: Object.fromEntries(
+        Array.from(mapUrlByCountryCode.entries()).sort(([a], [b]) =>
+          a.localeCompare(b),
+        ),
+      ),
+      unlockedRegions: Array.from(unlockedRegions).sort(),
+      availableRegions: Array.from(availableRegions).sort(),
+    };
+
+    return result;
   },
 );
 
@@ -88,8 +254,49 @@ const profileSlice = createSlice({
   reducers: {
     clearProfile: (state) => {
       state.profile = null;
+      state.collectedArtifactCount = 0;
+      state.unlockedCountryCodes = [];
+      state.availableCountryCodes = [];
+      state.artifactsByCountryCode = {};
+      state.mapUrlByCountryCode = {};
+      state.unlockedRegions = [];
+      state.availableRegions = [];
       state.status = "idle";
       state.error = null;
+    },
+    setHearts: (
+      state,
+      action: PayloadAction<number | { hearts: number; userId: string }>,
+    ) => {
+      const hearts =
+        typeof action.payload === "number"
+          ? action.payload
+          : action.payload.hearts;
+      const userId =
+        typeof action.payload === "number" ? undefined : action.payload.userId;
+
+      if (state.profile) {
+        state.profile.hearts = hearts;
+        return;
+      }
+      if (userId) {
+        state.profile = {
+          id: userId,
+          username: "",
+          hearts,
+          last_heart_reset: null,
+          total_items_restored: 0,
+          updated_at: null,
+          room_bg: null,
+        };
+      }
+    },
+    patchProfileRoomBg: (state, action: PayloadAction<string | null>) => {
+      if (state.profile) {
+        const v = action.payload;
+        state.profile.room_bg =
+          v == null ? null : typeof v === "string" ? v : null;
+      }
     },
   },
   extraReducers: (builder) => {
@@ -101,6 +308,19 @@ const profileSlice = createSlice({
       .addCase(fetchProfileByUserId.fulfilled, (state, action) => {
         state.status = "succeeded";
         state.profile = action.payload.profile;
+        state.collectedArtifactCount = action.payload.collectedArtifactCount;
+        state.unlockedCountryCodes = asSortedStringArray(
+          action.payload.unlockedCountryCodes,
+        );
+        state.availableCountryCodes = asSortedStringArray(
+          action.payload.availableCountryCodes,
+        );
+        state.artifactsByCountryCode = action.payload.artifactsByCountryCode ?? {};
+        state.mapUrlByCountryCode = action.payload.mapUrlByCountryCode ?? {};
+        state.unlockedRegions = asSortedStringArray(action.payload.unlockedRegions);
+        state.availableRegions = asSortedStringArray(
+          action.payload.availableRegions,
+        );
       })
       .addCase(fetchProfileByUserId.rejected, (state, action) => {
         state.status = "failed";
@@ -121,5 +341,5 @@ const profileSlice = createSlice({
   },
 });
 
-export const { clearProfile } = profileSlice.actions;
+export const { clearProfile, setHearts, patchProfileRoomBg } = profileSlice.actions;
 export const profileReducer = profileSlice.reducer;
