@@ -32,7 +32,9 @@ export const fetchProfileByUserId = createAsyncThunk(
 
     const { data, error } = await supabase
       .from("profiles")
-      .select("*")
+      .select(
+        "id, username, hearts, last_heart_reset, total_items_restored, updated_at, room_bg",
+      )
       .eq("id", userId)
       .maybeSingle();
 
@@ -41,6 +43,42 @@ export const fetchProfileByUserId = createAsyncThunk(
     }
 
     return { profile: (data as ProfileRecord | null) ?? null };
+  },
+);
+
+export const upsertProfile = createAsyncThunk(
+  "profile/upsert",
+  async (
+    payload: {
+      id: string;
+      username: string;
+    },
+    { rejectWithValue, getState },
+  ) => {
+    if (!supabase) {
+      return rejectWithValue("Supabase client is not configured.");
+    }
+
+    const p = (getState() as { profile: ProfileState }).profile.profile;
+    const upsertRow = {
+      id: payload.id,
+      username: payload.username,
+      ...(p?.id === payload.id ? { room_bg: p.room_bg } : {}),
+    };
+
+    const { data, error } = await supabase
+      .from("profiles")
+      .upsert(upsertRow, { onConflict: "id" })
+      .select(
+        "id, username, hearts, last_heart_reset, total_items_restored, updated_at, room_bg",
+      )
+      .single();
+
+    if (error) {
+      return rejectWithValue(error.message);
+    }
+
+    return data as ProfileRecord;
   },
 );
 
@@ -67,6 +105,18 @@ const profileSlice = createSlice({
       .addCase(fetchProfileByUserId.rejected, (state, action) => {
         state.status = "failed";
         state.error = (action.payload as string) ?? "Failed to fetch profile.";
+      })
+      .addCase(upsertProfile.pending, (state) => {
+        state.status = "loading";
+        state.error = null;
+      })
+      .addCase(upsertProfile.fulfilled, (state, action) => {
+        state.status = "succeeded";
+        state.profile = action.payload;
+      })
+      .addCase(upsertProfile.rejected, (state, action) => {
+        state.status = "failed";
+        state.error = (action.payload as string) ?? "Failed to save profile.";
       });
   },
 });
